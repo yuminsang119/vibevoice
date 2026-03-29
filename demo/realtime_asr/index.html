@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>119 실시간 음성 인식</title>
+    <title>119 실시간 음성 인식 + 지도</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -36,16 +36,10 @@
             cursor: pointer;
             transition: all 0.2s;
         }
-        #startBtn {
-            background: #e94560;
-            color: white;
-        }
+        #startBtn { background: #e94560; color: white; }
         #startBtn:hover { background: #c73a52; }
         #startBtn:disabled { background: #555; cursor: not-allowed; }
-        #stopBtn {
-            background: #533483;
-            color: white;
-        }
+        #stopBtn { background: #533483; color: white; }
         #stopBtn:hover { background: #6a42a0; }
         #stopBtn:disabled { background: #555; cursor: not-allowed; }
         .hotwords-input {
@@ -53,7 +47,7 @@
             gap: 8px;
             margin-bottom: 20px;
             width: 100%;
-            max-width: 600px;
+            max-width: 900px;
         }
         input[type="text"] {
             flex: 1;
@@ -85,13 +79,22 @@
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
         }
-        .transcript-box {
+
+        .main-content {
+            display: flex;
+            gap: 20px;
             width: 100%;
-            max-width: 800px;
+            max-width: 1200px;
+            flex-wrap: wrap;
+        }
+
+        .transcript-box {
+            flex: 1;
+            min-width: 350px;
             background: #16213e;
             border-radius: 12px;
             padding: 20px;
-            min-height: 300px;
+            min-height: 400px;
             max-height: 500px;
             overflow-y: auto;
         }
@@ -102,39 +105,103 @@
             border-radius: 8px;
             border-left: 3px solid #e94560;
         }
-        .segment .speaker {
+        .segment .speaker { font-weight: bold; color: #e94560; font-size: 0.85rem; }
+        .segment .time { color: #888; font-size: 0.8rem; margin-left: 8px; }
+        .segment .content { margin-top: 4px; line-height: 1.5; }
+        .segment.partial { border-left-color: #533483; opacity: 0.7; }
+
+        .map-panel {
+            flex: 1;
+            min-width: 350px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .map-container {
+            background: #16213e;
+            border-radius: 12px;
+            overflow: hidden;
+            height: 320px;
+            position: relative;
+        }
+        .map-container iframe {
+            width: 100%;
+            height: 100%;
+            border: none;
+        }
+        .map-placeholder {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #555;
+            font-size: 0.9rem;
+        }
+
+        .location-list {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 16px;
+            max-height: 168px;
+            overflow-y: auto;
+        }
+        .location-item {
+            padding: 10px;
+            margin-bottom: 8px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+            border-left: 3px solid #0fa;
+        }
+        .location-item .addr {
             font-weight: bold;
-            color: #e94560;
+            color: #0fa;
             font-size: 0.85rem;
         }
-        .segment .time {
+        .location-item .coords {
             color: #888;
             font-size: 0.8rem;
-            margin-left: 8px;
+            margin-top: 2px;
         }
-        .segment .content {
-            margin-top: 4px;
-            line-height: 1.5;
+        .location-item .map-links {
+            margin-top: 6px;
+            display: flex;
+            gap: 8px;
         }
-        .segment.partial {
-            border-left-color: #533483;
-            opacity: 0.7;
+        .location-item .map-links a {
+            color: #a78bfa;
+            text-decoration: none;
+            font-size: 0.8rem;
+            padding: 2px 8px;
+            border: 1px solid #533483;
+            border-radius: 4px;
         }
+        .location-item .map-links a:hover {
+            background: #533483;
+            color: white;
+        }
+
         .info {
             color: #888;
             font-size: 0.85rem;
             margin-top: 10px;
             text-align: center;
         }
+        .section-title {
+            color: #aaa;
+            font-size: 0.8rem;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
     </style>
 </head>
 <body>
-    <h1>119 실시간 음성 인식 (VibeVoice ASR)</h1>
+    <h1>119 실시간 음성 인식 + 주소 좌표 변환</h1>
 
     <div class="hotwords-input">
         <input type="text" id="hotwords"
                placeholder="핫워드 (쉼표 구분): 화재,구급,구조,테헤란로,삼성아파트"
-               value="화재,구급,구조,교통사고,서울,부산,대구,인천">
+               value="화재,구급,구조,교통사고,서울,부산,대구,인천,강남,테헤란로">
     </div>
 
     <div class="controls">
@@ -144,12 +211,29 @@
 
     <div class="status idle" id="status">대기 중</div>
 
-    <div class="transcript-box" id="transcriptBox">
-        <div class="info">녹음을 시작하면 실시간 전사 결과가 여기에 표시됩니다.</div>
+    <div class="main-content">
+        <!-- 왼쪽: 전사 결과 -->
+        <div class="transcript-box" id="transcriptBox">
+            <div class="section-title">실시간 전사</div>
+            <div class="info">녹음을 시작하면 실시간 전사 결과가 표시됩니다.</div>
+        </div>
+
+        <!-- 오른쪽: 지도 + 좌표 -->
+        <div class="map-panel">
+            <div class="map-container" id="mapContainer">
+                <div class="map-placeholder" id="mapPlaceholder">
+                    주소가 인식되면 지도가 표시됩니다
+                </div>
+            </div>
+            <div class="location-list" id="locationList">
+                <div class="section-title">추출된 위치 정보</div>
+                <div class="info" id="locationPlaceholder">아직 위치 정보가 없습니다</div>
+            </div>
+        </div>
     </div>
 
     <p class="info" style="margin-top: 16px;">
-        마이크 입력을 16kHz PCM으로 변환하여 WebSocket으로 전송합니다.
+        음성 인식 결과에서 주소를 자동 추출하고 위경도 좌표로 변환합니다.
     </p>
 
     <script>
@@ -165,13 +249,53 @@
             el.className = 'status ' + className;
         }
 
+        function updateMap(lat, lng, address) {
+            const container = document.getElementById('mapContainer');
+            const placeholder = document.getElementById('mapPlaceholder');
+            if (placeholder) placeholder.remove();
+
+            // OpenStreetMap iframe
+            container.innerHTML = `<iframe src="https://www.openstreetmap.org/export/embed.html?bbox=${lng-0.005},${lat-0.003},${lng+0.005},${lat+0.003}&layer=mapnik&marker=${lat},${lng}" allowfullscreen></iframe>`;
+        }
+
+        function addLocation(locData) {
+            const list = document.getElementById('locationList');
+            const placeholder = document.getElementById('locationPlaceholder');
+            if (placeholder) placeholder.remove();
+
+            const extracted = locData.extracted || {};
+            const geo = locData.geocode;
+            const urls = locData.map_urls || {};
+
+            const div = document.createElement('div');
+            div.className = 'location-item';
+
+            let html = `<div class="addr">${extracted.full || extracted.address || '주소 불명'}</div>`;
+
+            if (geo && geo.latitude) {
+                html += `<div class="coords">${geo.latitude.toFixed(6)}, ${geo.longitude.toFixed(6)} (${geo.source})</div>`;
+                html += `<div class="map-links">`;
+                if (urls.kakao) html += `<a href="${urls.kakao}" target="_blank">카카오</a>`;
+                if (urls.naver) html += `<a href="${urls.naver}" target="_blank">네이버</a>`;
+                if (urls.google) html += `<a href="${urls.google}" target="_blank">구글</a>`;
+                html += `</div>`;
+
+                // 지도 업데이트
+                updateMap(geo.latitude, geo.longitude, geo.road_address || extracted.address);
+            } else {
+                html += `<div class="coords">좌표 변환 대기 중 (API 키 설정 필요)</div>`;
+            }
+
+            div.innerHTML = html;
+            list.appendChild(div);
+            list.scrollTop = list.scrollHeight;
+        }
+
         function addSegment(data, isPartial) {
             const box = document.getElementById('transcriptBox');
-            // 첫 결과시 안내 문구 제거
             const info = box.querySelector('.info');
             if (info) info.remove();
 
-            // partial이면 기존 partial 제거
             if (isPartial) {
                 const prev = box.querySelectorAll('.partial');
                 prev.forEach(el => el.remove());
@@ -185,7 +309,6 @@
             segments.forEach(seg => {
                 const div = document.createElement('div');
                 div.className = 'segment' + (isPartial ? ' partial' : '');
-
                 let html = '';
                 if (seg.Speaker !== undefined) {
                     html += `<span class="speaker">화자 ${seg.Speaker}</span>`;
@@ -194,12 +317,15 @@
                     html += `<span class="time">${seg.Start.toFixed(1)}s - ${seg.End.toFixed(1)}s</span>`;
                 }
                 html += `<div class="content">${seg.Content || seg.text || ''}</div>`;
-
                 div.innerHTML = html;
                 box.appendChild(div);
             });
-
             box.scrollTop = box.scrollHeight;
+
+            // 위치 정보 처리
+            if (data.locations && data.locations.length > 0) {
+                data.locations.forEach(loc => addLocation(loc));
+            }
         }
 
         async function startRecording() {
@@ -243,14 +369,11 @@
 
                 audioContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
                 const source = audioContext.createMediaStreamSource(mediaStream);
-
-                // ScriptProcessorNode로 PCM 데이터 추출
                 const bufferSize = 4096;
                 processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
                 processor.onaudioprocess = (e) => {
                     if (ws && ws.readyState === WebSocket.OPEN) {
                         const float32 = e.inputBuffer.getChannelData(0);
-                        // float32 -> int16 PCM
                         const int16 = new Int16Array(float32.length);
                         for (let i = 0; i < float32.length; i++) {
                             const s = Math.max(-1, Math.min(1, float32[i]));
@@ -259,10 +382,8 @@
                         ws.send(int16.buffer);
                     }
                 };
-
                 source.connect(processor);
                 processor.connect(audioContext.destination);
-
             } catch (err) {
                 console.error('마이크 접근 오류:', err);
                 setStatus('마이크 접근 불가', 'idle');
@@ -274,18 +395,9 @@
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ command: 'stop' }));
             }
-            if (processor) {
-                processor.disconnect();
-                processor = null;
-            }
-            if (audioContext) {
-                audioContext.close();
-                audioContext = null;
-            }
-            if (mediaStream) {
-                mediaStream.getTracks().forEach(t => t.stop());
-                mediaStream = null;
-            }
+            if (processor) { processor.disconnect(); processor = null; }
+            if (audioContext) { audioContext.close(); audioContext = null; }
+            if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
             setStatus('대기 중', 'idle');
             document.getElementById('startBtn').disabled = false;
             document.getElementById('stopBtn').disabled = true;

@@ -1,20 +1,27 @@
 """
-실시간 전화 음성 → ASR 변환 서버
+실시간 전화 음성 → ASR 변환 + 주소 좌표 변환 서버
 
 실시간으로 전화 음성(PCM 오디오 스트림)을 WebSocket으로 수신하고,
-VibeVoice ASR 모델로 텍스트 변환 결과를 반환합니다.
+VibeVoice ASR 모델로 텍스트 변환 후 주소를 추출하여 좌표로 변환합니다.
 
 사용법:
     MODEL_PATH=microsoft/VibeVoice-ASR python app.py
 
+    # 카카오 지오코딩 사용 시 (권장)
+    KAKAO_REST_API_KEY=... MODEL_PATH=microsoft/VibeVoice-ASR python app.py
+
 클라이언트 연결:
     ws://localhost:8080/ws/transcribe
     - 오디오 청크를 binary 메시지로 전송 (16-bit PCM, 16kHz, mono)
-    - 전사 결과를 JSON text 메시지로 수신
+    - 전사 결과 + 주소 좌표를 JSON text 메시지로 수신
 
 Twilio 연동:
     ws://localhost:8080/ws/twilio
     - Twilio Media Stream 프로토콜과 호환
+
+REST API:
+    GET /api/geocode?address=서울시+강남구+테헤란로+152
+    POST /api/extract-address  {"text": "서울 강남구 테헤란로 152 강남파이낸스센터"}
 """
 
 import asyncio
@@ -32,11 +39,16 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Dict, List, Optional
 
+import urllib.parse
+
 import numpy as np
 import torch
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
+from pydantic import BaseModel
 from starlette.websockets import WebSocketState
+
+from geocoding import extract_addresses, geocode, geocode_from_segments, GeoResult
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -220,7 +232,21 @@ class RealtimeASRService:
         }
 
 
-app = FastAPI(title="VibeVoice 실시간 ASR 서버")
+async def enrich_with_geocoding(result: Dict[str, Any]) -> Dict[str, Any]:
+    """ASR 결과에 주소 추출 + 좌표 변환 결과를 추가합니다."""
+    segments = result.get("segments", [])
+    if segments:
+        try:
+            locations = await geocode_from_segments(segments)
+            if locations:
+                result["locations"] = locations
+                logger.info(f"주소 {len(locations)}건 추출/변환 완료")
+        except Exception as e:
+            logger.warning(f"지오코딩 실패: {e}")
+    return result
+
+
+app = FastAPI(title="VibeVoice 실시간 ASR + 지오코딩 서버")
 
 
 @app.on_event("startup")
@@ -299,6 +325,7 @@ async def websocket_transcribe(ws: WebSocket):
                             service.transcribe, temp_path
                         )
                         result["type"] = "partial"
+                        result = await enrich_with_geocoding(result)
                         await ws.send_text(json.dumps(result, ensure_ascii=False))
                     except Exception as e:
                         logger.error(f"ASR 오류: {e}")
@@ -329,6 +356,7 @@ async def websocket_transcribe(ws: WebSocket):
                                 service.transcribe, temp_path
                             )
                             result["type"] = "final"
+                            result = await enrich_with_geocoding(result)
                             await ws.send_text(
                                 json.dumps(result, ensure_ascii=False)
                             )
@@ -357,6 +385,7 @@ async def websocket_transcribe(ws: WebSocket):
             try:
                 result = await asyncio.to_thread(service.transcribe, temp_path)
                 result["type"] = "final_complete"
+                result = await enrich_with_geocoding(result)
                 if ws.client_state == WebSocketState.CONNECTED:
                     await ws.send_text(json.dumps(result, ensure_ascii=False))
             except Exception as e:
@@ -444,6 +473,7 @@ async def websocket_twilio(ws: WebSocket):
                         result["type"] = "transcription"
                         result["call_sid"] = call_sid
                         result["stream_sid"] = stream_sid
+                        result = await enrich_with_geocoding(result)
                         await ws.send_text(json.dumps(result, ensure_ascii=False))
                     except Exception as e:
                         logger.error(f"Twilio ASR 오류: {e}")
@@ -470,6 +500,7 @@ async def websocket_twilio(ws: WebSocket):
                         )
                         result["type"] = "final"
                         result["call_sid"] = call_sid
+                        result = await enrich_with_geocoding(result)
                         await ws.send_text(json.dumps(result, ensure_ascii=False))
                     except Exception as e:
                         logger.error(f"최종 전사 오류: {e}")
@@ -488,6 +519,41 @@ async def websocket_twilio(ws: WebSocket):
 async def index():
     """테스트 페이지"""
     return FileResponse(Path(__file__).parent / "index.html")
+
+
+@app.get("/api/geocode")
+async def api_geocode(address: str = Query(..., description="변환할 주소")):
+    """주소 → 좌표 변환 REST API"""
+    result = await geocode(address)
+    if result:
+        return {
+            "status": "ok",
+            "result": result.to_dict(),
+            "map_urls": {
+                "kakao": f"https://map.kakao.com/link/map/{urllib.parse.quote(result.road_address or address)},{result.latitude},{result.longitude}",
+                "naver": f"https://map.naver.com/v5/search/{urllib.parse.quote(result.road_address or address)}?c={result.longitude},{result.latitude},15,0,0,0,dh",
+                "google": f"https://www.google.com/maps/search/?api=1&query={result.latitude},{result.longitude}",
+            },
+        }
+    return {"status": "not_found", "message": f"주소를 찾을 수 없습니다: {address}"}
+
+
+class ExtractAddressRequest(BaseModel):
+    text: str
+
+
+@app.post("/api/extract-address")
+async def api_extract_address(req: ExtractAddressRequest):
+    """텍스트에서 주소 추출 + 좌표 변환 REST API"""
+    addresses = extract_addresses(req.text)
+    results = []
+    for addr_info in addresses:
+        geo = await geocode(addr_info["full"])
+        results.append({
+            "extracted": addr_info,
+            "geocode": geo.to_dict() if geo else None,
+        })
+    return {"status": "ok", "addresses": results, "count": len(results)}
 
 
 @app.get("/health")
