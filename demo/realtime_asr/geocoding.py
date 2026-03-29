@@ -66,6 +66,21 @@ JIBEON_ADDR_PATTERN = re.compile(
     r"(?P<number>\d+(?:-\d+)?)\s*번?지?"
 )
 
+# 교차로/사거리: ~로 ~로 교차로, ~사거리
+INTERSECTION_PATTERN = re.compile(
+    r"(?P<road1>[가-힣0-9]+(?:로|대로|길))"
+    r"(?:\s*(?:하고|이?랑|에서|과|와))?\s*"
+    r"(?P<road2>[가-힣0-9]+(?:로|대로|길))"
+    r"\s*(?P<type>교차로|사거리|삼거리|오거리|네거리|교차점|갈림길)"
+)
+
+# 이름 있는 교차로: ~사거리, ~삼거리, ~교차로 (고유명사)
+NAMED_INTERSECTION_PATTERN = re.compile(
+    r"(?P<name>[가-힣A-Za-z0-9]+(?:사거리|삼거리|오거리|네거리|교차로|로터리|회전교차로|IC|JC|나들목|분기점))"
+    r"(?:\s*(?:에서|부터|의|쪽))?"
+    r"(?:\s*(?P<direction>앞|뒤|옆|근처|건너편|맞은편|동쪽|서쪽|남쪽|북쪽|방면|방향|쪽))?"
+)
+
 # 랜드마크 기반 위치: ~역 N번 출구, ~건물 앞/뒤
 LANDMARK_PATTERN = re.compile(
     r"(?P<landmark>[가-힣A-Za-z0-9]+(?:역|센터|타워|빌딩|아파트|학교|병원|공원|시장|마트|백화점))"
@@ -106,7 +121,39 @@ def extract_addresses(text: str) -> List[Dict[str, str]]:
             "full": addr.strip(),
         })
 
-    # 랜드마크 추출 (주소가 없을 때만)
+    # 교차로 추출 (도로명 2개 조합)
+    for m in INTERSECTION_PATTERN.finditer(text):
+        road1 = m.group("road1")
+        road2 = m.group("road2")
+        itype = m.group("type")
+        full = f"{road1} {road2} {itype}"
+        results.append({
+            "type": "intersection",
+            "address": full,
+            "detail": f"{road1} x {road2}",
+            "roads": [road1, road2],
+            "intersection_type": itype,
+            "full": full,
+        })
+
+    # 고유명사 교차로 추출 (동백섬사거리, 둔산사거리 등)
+    named_seen = set()
+    for m in NAMED_INTERSECTION_PATTERN.finditer(text):
+        name = m.group("name")
+        direction = m.group("direction") or ""
+        # 이미 도로명/지번으로 추출된 것과 중복 방지
+        if name in named_seen:
+            continue
+        named_seen.add(name)
+        full = f"{name} {direction}".strip()
+        results.append({
+            "type": "named_intersection",
+            "address": name,
+            "detail": direction,
+            "full": full,
+        })
+
+    # 랜드마크 추출 (주소/교차로가 없을 때만)
     if not results:
         for m in LANDMARK_PATTERN.finditer(text):
             landmark = m.group("landmark")
