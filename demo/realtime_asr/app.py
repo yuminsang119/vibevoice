@@ -49,6 +49,7 @@ from pydantic import BaseModel
 from starlette.websockets import WebSocketState
 
 from geocoding import extract_addresses, geocode, geocode_from_segments, GeoResult
+from control import SessionManager, classify_urgency, classify_report_type, extract_patient_info
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -267,6 +268,7 @@ async def startup():
 
     app.state.asr_service = service
     app.state.lock = asyncio.Lock()
+    app.state.session_manager = SessionManager()
     logger.info("실시간 ASR 서버 준비 완료")
 
 
@@ -554,6 +556,94 @@ async def api_extract_address(req: ExtractAddressRequest):
             "geocode": geo.to_dict() if geo else None,
         })
     return {"status": "ok", "addresses": results, "count": len(results)}
+
+
+# ---------- 통제(관제) API ----------
+
+@app.get("/api/control/stats")
+async def api_control_stats():
+    """전체 현황 통계"""
+    sm: SessionManager = app.state.session_manager
+    return sm.get_stats()
+
+
+@app.get("/api/control/sessions")
+async def api_control_sessions(status: Optional[str] = None):
+    """세션 목록 조회 (status: active, completed, dispatched)"""
+    sm: SessionManager = app.state.session_manager
+    if status == "active":
+        return {"sessions": sm.get_active_sessions()}
+    return {"sessions": sm.get_all_sessions()}
+
+
+@app.get("/api/control/session/{session_id}")
+async def api_control_session_detail(session_id: str):
+    """세션 상세 조회"""
+    sm: SessionManager = app.state.session_manager
+    session = sm.get_session(session_id)
+    if not session:
+        return {"status": "not_found"}
+    return session.to_dict()
+
+
+@app.post("/api/control/session/{session_id}/dispatch")
+async def api_control_dispatch(session_id: str):
+    """출동 지령서 생성"""
+    sm: SessionManager = app.state.session_manager
+    dispatch = sm.generate_dispatch_order(session_id)
+    if not dispatch:
+        return {"status": "not_found"}
+    return {"status": "ok", "dispatch_order": dispatch}
+
+
+class AnalyzeTextRequest(BaseModel):
+    text: str
+
+
+@app.post("/api/control/analyze")
+async def api_control_analyze(req: AnalyzeTextRequest):
+    """텍스트 분석 (긴급도 + 신고유형 + 환자정보 + 주소)"""
+    urgency = classify_urgency(req.text)
+    report_type = classify_report_type(req.text)
+    patients = extract_patient_info(req.text)
+    addresses = extract_addresses(req.text)
+
+    locations = []
+    for addr in addresses:
+        geo = await geocode(addr["full"])
+        locations.append({
+            "extracted": addr,
+            "geocode": geo.to_dict() if geo else None,
+        })
+
+    return {
+        "urgency": urgency,
+        "report_type": report_type,
+        "patients": patients,
+        "locations": locations,
+    }
+
+
+@app.post("/api/control/session")
+async def api_control_create_session():
+    """수동 세션 생성"""
+    sm: SessionManager = app.state.session_manager
+    session = sm.create_session()
+    return {"status": "ok", "session_id": session.session_id}
+
+
+@app.post("/api/control/session/{session_id}/close")
+async def api_control_close_session(session_id: str):
+    """세션 종료"""
+    sm: SessionManager = app.state.session_manager
+    sm.close_session(session_id)
+    return {"status": "ok"}
+
+
+@app.get("/control")
+async def control_page():
+    """통제 대시보드 페이지"""
+    return FileResponse(Path(__file__).parent / "control.html")
 
 
 @app.get("/health")
