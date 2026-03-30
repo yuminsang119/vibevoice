@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>119 ASR 데이터 검수</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Malgun Gothic', sans-serif; background: #1a1a2e; color: #eee; }
+.header { background: #16213e; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #0f3460; }
+.header h1 { font-size: 20px; color: #e94560; }
+.header .stats { font-size: 14px; color: #999; }
+
+.container { display: flex; height: calc(100vh - 60px); }
+
+/* 왼쪽: 대기 목록 */
+.queue-panel { width: 320px; background: #16213e; border-right: 1px solid #0f3460; overflow-y: auto; }
+.queue-header { padding: 12px 15px; font-size: 14px; color: #999; border-bottom: 1px solid #0f3460; }
+.queue-item { padding: 12px 15px; border-bottom: 1px solid #0f3460; cursor: pointer; transition: background 0.2s; }
+.queue-item:hover { background: #1a1a3e; }
+.queue-item.active { background: #0f3460; border-left: 3px solid #e94560; }
+.queue-item .call-id { font-size: 12px; color: #888; margin-bottom: 4px; word-break: break-all; }
+.queue-item .info { display: flex; justify-content: space-between; }
+.queue-item .duration { font-size: 13px; }
+.queue-item .confidence { font-size: 13px; font-weight: bold; }
+.conf-high { color: #00c853; }
+.conf-mid { color: #ffab00; }
+.conf-low { color: #e94560; }
+
+/* 오른쪽: 검수 영역 */
+.review-panel { flex: 1; display: flex; flex-direction: column; padding: 20px 30px; overflow-y: auto; }
+.review-panel h2 { font-size: 18px; margin-bottom: 15px; color: #e94560; }
+
+.audio-player { margin-bottom: 20px; }
+.audio-player audio { width: 100%; }
+
+.segment-list { flex: 1; overflow-y: auto; margin-bottom: 20px; }
+.segment { display: flex; gap: 10px; margin-bottom: 10px; padding: 10px; background: #16213e; border-radius: 8px; border: 1px solid #0f3460; }
+.segment .meta { min-width: 80px; font-size: 12px; color: #888; }
+.segment .meta .speaker { font-weight: bold; color: #aaa; margin-bottom: 4px; }
+.segment .text-edit { flex: 1; }
+.segment textarea { width: 100%; min-height: 50px; background: #1a1a2e; color: #eee; border: 1px solid #333; border-radius: 4px; padding: 8px; font-size: 14px; font-family: inherit; resize: vertical; }
+.segment textarea:focus { border-color: #e94560; outline: none; }
+.segment .original { font-size: 11px; color: #666; margin-top: 4px; font-style: italic; }
+
+.actions { display: flex; gap: 15px; padding: 15px 0; border-top: 1px solid #0f3460; }
+.btn { padding: 12px 30px; border: none; border-radius: 6px; font-size: 15px; font-weight: bold; cursor: pointer; transition: opacity 0.2s; }
+.btn:hover { opacity: 0.85; }
+.btn-approve { background: #00c853; color: #fff; }
+.btn-reject { background: #e94560; color: #fff; }
+.btn-skip { background: #555; color: #fff; }
+
+.empty-state { text-align: center; padding: 100px 20px; color: #666; }
+.empty-state h2 { font-size: 24px; margin-bottom: 10px; }
+
+.keyboard-hint { font-size: 12px; color: #666; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+    <h1>119 ASR 데이터 검수</h1>
+    <div class="stats" id="stats">대기: -건</div>
+</div>
+
+<div class="container">
+    <div class="queue-panel" id="queuePanel">
+        <div class="queue-header">검수 대기 목록</div>
+    </div>
+
+    <div class="review-panel" id="reviewPanel">
+        <div class="empty-state" id="emptyState">
+            <h2>검수할 데이터를 선택하세요</h2>
+            <p>왼쪽 목록에서 항목을 클릭하면 오디오를 듣고 전사 텍스트를 교정할 수 있습니다.</p>
+            <p style="margin-top:20px; color:#888;">
+                ASR이 자동 전사한 텍스트를 사람이 교정해야<br>
+                정확한 학습 데이터가 됩니다.
+            </p>
+        </div>
+
+        <div id="reviewContent" style="display:none;">
+            <h2 id="reviewTitle">-</h2>
+
+            <div class="audio-player">
+                <audio id="audioPlayer" controls preload="auto"></audio>
+            </div>
+
+            <div class="segment-list" id="segmentList"></div>
+
+            <div class="actions">
+                <button class="btn btn-approve" onclick="submitReview(true)">승인 (Ctrl+Enter)</button>
+                <button class="btn btn-reject" onclick="submitReview(false)">거부 (Ctrl+Delete)</button>
+                <button class="btn btn-skip" onclick="skipToNext()">건너뛰기 (Ctrl+→)</button>
+            </div>
+            <div class="keyboard-hint">
+                Tab: 다음 세그먼트 | Ctrl+Enter: 승인 | Ctrl+Delete: 거부 | Ctrl+Space: 재생/정지
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+let queue = [];
+let currentItem = null;
+let currentIndex = -1;
+
+async function loadQueue() {
+    const res = await fetch('/api/review/queue');
+    const data = await res.json();
+    queue = data.queue;
+    document.getElementById('stats').textContent = `대기: ${data.count}건`;
+    renderQueue();
+}
+
+function renderQueue() {
+    const panel = document.getElementById('queuePanel');
+    const header = panel.querySelector('.queue-header');
+    panel.innerHTML = '';
+    panel.appendChild(header);
+    header.textContent = `검수 대기 목록 (${queue.length}건)`;
+
+    queue.forEach((item, i) => {
+        const div = document.createElement('div');
+        div.className = 'queue-item' + (i === currentIndex ? ' active' : '');
+        const conf = item.confidence;
+        const confClass = conf >= 0.7 ? 'conf-mid' : 'conf-low';
+        div.innerHTML = `
+            <div class="call-id">${item.call_id}</div>
+            <div class="info">
+                <span class="duration">${item.duration.toFixed(1)}초 / ${item.segments.length}세그</span>
+                <span class="confidence ${confClass}">${(conf*100).toFixed(0)}%</span>
+            </div>
+        `;
+        div.onclick = () => selectItem(i);
+        panel.appendChild(div);
+    });
+}
+
+function selectItem(index) {
+    currentIndex = index;
+    currentItem = queue[index];
+    renderQueue();
+
+    document.getElementById('emptyState').style.display = 'none';
+    document.getElementById('reviewContent').style.display = 'block';
+    document.getElementById('reviewTitle').textContent =
+        `${currentItem.call_id} (신뢰도: ${(currentItem.confidence*100).toFixed(0)}%)`;
+
+    // 오디오 로드
+    const audio = document.getElementById('audioPlayer');
+    audio.src = `/api/review/audio/${currentItem.call_id}`;
+
+    // 세그먼트 렌더링
+    const list = document.getElementById('segmentList');
+    list.innerHTML = '';
+
+    currentItem.segments.forEach((seg, i) => {
+        const div = document.createElement('div');
+        div.className = 'segment';
+        const startStr = formatTime(seg.start);
+        const endStr = formatTime(seg.end);
+        div.innerHTML = `
+            <div class="meta">
+                <div class="speaker">화자 ${seg.speaker}</div>
+                <div>${startStr}-${endStr}</div>
+                <div style="margin-top:5px">
+                    <button onclick="playSegment(${seg.start})" style="background:#333;color:#eee;border:none;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:11px;">재생</button>
+                </div>
+            </div>
+            <div class="text-edit">
+                <textarea id="seg_${i}" rows="2">${seg.text}</textarea>
+                <div class="original">원본: ${seg.text}</div>
+            </div>
+        `;
+        list.appendChild(div);
+    });
+}
+
+function formatTime(seconds) {
+    if (!seconds) return '0:00';
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+function playSegment(startTime) {
+    const audio = document.getElementById('audioPlayer');
+    audio.currentTime = startTime;
+    audio.play();
+}
+
+function getCorrectedSegments() {
+    return currentItem.segments.map((seg, i) => {
+        const textarea = document.getElementById(`seg_${i}`);
+        return {
+            speaker: seg.speaker,
+            text: textarea ? textarea.value.trim() : seg.text,
+            start: seg.start,
+            end: seg.end,
+        };
+    });
+}
+
+async function submitReview(approved) {
+    if (!currentItem) return;
+
+    const corrected = approved ? getCorrectedSegments() : [];
+
+    const res = await fetch('/api/review/submit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            call_id: currentItem.call_id,
+            approved: approved,
+            corrected_segments: corrected,
+        }),
+    });
+
+    const data = await res.json();
+    if (data.status === 'ok') {
+        // 목록에서 제거
+        queue.splice(currentIndex, 1);
+        if (queue.length === 0) {
+            currentIndex = -1;
+            currentItem = null;
+            document.getElementById('reviewContent').style.display = 'none';
+            document.getElementById('emptyState').style.display = 'block';
+        } else {
+            currentIndex = Math.min(currentIndex, queue.length - 1);
+            selectItem(currentIndex);
+        }
+        renderQueue();
+        document.getElementById('stats').textContent = `대기: ${queue.length}건`;
+    }
+}
+
+function skipToNext() {
+    if (queue.length === 0) return;
+    const next = (currentIndex + 1) % queue.length;
+    selectItem(next);
+}
+
+// 키보드 단축키
+document.addEventListener('keydown', (e) => {
+    if (e.ctrlKey && e.key === 'Enter') {
+        e.preventDefault();
+        submitReview(true);
+    } else if (e.ctrlKey && e.key === 'Delete') {
+        e.preventDefault();
+        submitReview(false);
+    } else if (e.ctrlKey && e.key === 'ArrowRight') {
+        e.preventDefault();
+        skipToNext();
+    } else if (e.ctrlKey && e.key === ' ') {
+        e.preventDefault();
+        const audio = document.getElementById('audioPlayer');
+        if (audio.paused) audio.play(); else audio.pause();
+    }
+});
+
+// 초기 로드
+loadQueue();
+// 30초마다 새로 고침
+setInterval(loadQueue, 30000);
+</script>
+</body>
+</html>
