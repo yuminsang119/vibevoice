@@ -572,15 +572,17 @@ class DataValidator:
 # ---------- 3단계: 학습 ----------
 
 class ContinuousTrainer:
-    """지속적으로 LoRA 학습을 수행합니다."""
+    """지속적으로 LoRA 학습을 수행합니다. H100 x4 최적화."""
 
     def __init__(
         self,
         base_model: str = "microsoft/VibeVoice-ASR",
         device: str = "cuda",
+        num_gpus: int = 4,
     ):
         self.base_model = base_model
         self.device = device
+        self.num_gpus = num_gpus
         self.current_version = self._get_latest_version()
 
     def _get_latest_version(self) -> int:
@@ -619,27 +621,51 @@ class ContinuousTrainer:
         logger.info(f"학습 데이터 준비: {count}건 + 시드 데이터")
         return flat_dir
 
+    def _auto_hyperparams(self, json_count: int, lora_r: int) -> Dict[str, Any]:
+        """데이터 규모에 따라 하이퍼파라미터를 자동 조정합니다."""
+        if json_count < 100:
+            return {"epochs": 20, "lr": 5e-5, "warmup": 100, "lora_r": 16,
+                    "lora_alpha": 32, "grad_accum": 8, "save_steps": 50}
+        elif json_count < 1000:
+            return {"epochs": 10, "lr": 1e-4, "warmup": 200, "lora_r": 32,
+                    "lora_alpha": 64, "grad_accum": 8, "save_steps": 100}
+        elif json_count < 10000:
+            return {"epochs": 5, "lr": 1e-4, "warmup": 500, "lora_r": 64,
+                    "lora_alpha": 128, "grad_accum": 4, "save_steps": 500}
+        else:
+            return {"epochs": 3, "lr": 5e-5, "warmup": 1000, "lora_r": 64,
+                    "lora_alpha": 128, "grad_accum": 4, "save_steps": 1000}
+
     def train(
         self,
-        epochs: int = 5,
-        learning_rate: float = 1e-4,
-        lora_r: int = 16,
+        epochs: int = None,
+        learning_rate: float = None,
+        lora_r: int = None,
         resume_from: str = None,
     ) -> Path:
-        """LoRA 학습을 실행하고 새 버전 모델을 저장합니다."""
+        """LoRA 학습을 실행합니다. H100 x4 멀티GPU + 자동 하이퍼파라미터."""
         self.current_version += 1
         version_tag = f"119_asr_v{self.current_version:04d}"
         output_dir = MODELS_DIR / version_tag
 
         data_dir = self._prepare_flat_dataset()
 
-        # 학습 데이터가 있는지 확인
         json_count = len(list(data_dir.glob("*.json")))
         if json_count == 0:
             logger.error("학습 데이터가 없습니다. 먼저 데이터를 수집/검증하세요.")
             return None
 
-        # base_model 결정: 이전 버전이 있으면 이어서 학습
+        # 자동 하이퍼파라미터
+        auto = self._auto_hyperparams(json_count, lora_r or 16)
+        epochs = epochs or auto["epochs"]
+        learning_rate = learning_rate or auto["lr"]
+        lora_r = lora_r or auto["lora_r"]
+        lora_alpha = auto["lora_alpha"]
+        grad_accum = auto["grad_accum"]
+        warmup = auto["warmup"]
+        save_steps = auto["save_steps"]
+
+        # base_model 결정
         model_path = self.base_model
         if resume_from:
             model_path = resume_from
@@ -650,36 +676,70 @@ class ContinuousTrainer:
                 model_path = str(prev_model)
                 logger.info(f"이전 모델에서 이어서 학습: {prev_version}")
 
-        logger.info(f"학습 시작: {version_tag} (데이터 {json_count}건, epochs={epochs})")
+        effective_batch = 1 * self.num_gpus * grad_accum
+        logger.info(
+            f"학습 시작: {version_tag} | 데이터 {json_count}건 | "
+            f"epochs={epochs} | lr={learning_rate} | lora_r={lora_r} | "
+            f"유효배치={effective_batch} | GPU {self.num_gpus}장"
+        )
 
-        cmd = [
-            sys.executable, str(FINETUNE_DIR / "lora_finetune.py"),
+        # H100 최적화 환경변수
+        env = os.environ.copy()
+        env.update({
+            "NCCL_P2P_LEVEL": "NVL",
+            "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+            "NVIDIA_TF32_OVERRIDE": "1",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "TOKENIZERS_PARALLELISM": "false",
+        })
+
+        # torchrun으로 멀티GPU 학습
+        if self.num_gpus > 1:
+            cmd = [
+                "torchrun",
+                f"--nproc_per_node={self.num_gpus}",
+                "--master_port=29500",
+                str(FINETUNE_DIR / "lora_finetune.py"),
+            ]
+        else:
+            cmd = [sys.executable, str(FINETUNE_DIR / "lora_finetune.py")]
+
+        cmd.extend([
             "--model_path", model_path,
             "--data_dir", str(data_dir),
             "--use_customized_context", "True",
             "--output_dir", str(output_dir),
             "--num_train_epochs", str(epochs),
             "--per_device_train_batch_size", "1",
-            "--gradient_accumulation_steps", "8",
+            "--gradient_accumulation_steps", str(grad_accum),
             "--learning_rate", str(learning_rate),
-            "--warmup_steps", "50",
+            "--lr_scheduler_type", "cosine",
+            "--warmup_steps", str(warmup),
+            "--weight_decay", "0.01",
+            "--max_grad_norm", "1.0",
             "--logging_steps", "5",
-            "--save_steps", "50",
-            "--save_total_limit", "3",
+            "--save_steps", str(save_steps),
+            "--save_total_limit", "5",
             "--bf16", "True" if self.device == "cuda" else "False",
+            "--tf32", "True" if self.device == "cuda" else "False",
+            "--gradient_checkpointing", "True",
+            "--dataloader_pin_memory", "True",
             "--seed", "42",
             "--report_to", "none",
             "--lora_r", str(lora_r),
-        ]
+            "--lora_alpha", str(lora_alpha),
+            "--lora_dropout", "0.05",
+        ])
+
+        if self.num_gpus > 1:
+            cmd.extend(["--ddp_find_unused_parameters", "False"])
 
         log_path = LOGS_DIR / f"train_{version_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
         with open(log_path, "w") as log_file:
             process = subprocess.run(
-                cmd,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                cwd=str(REPO_ROOT),
+                cmd, stdout=log_file, stderr=subprocess.STDOUT,
+                cwd=str(REPO_ROOT), env=env,
             )
 
         if process.returncode != 0:
@@ -694,6 +754,9 @@ class ContinuousTrainer:
             "epochs": epochs,
             "learning_rate": learning_rate,
             "lora_r": lora_r,
+            "lora_alpha": lora_alpha,
+            "num_gpus": self.num_gpus,
+            "effective_batch_size": effective_batch,
             "trained_at": datetime.now().isoformat(),
             "log_path": str(log_path),
         }
@@ -1106,6 +1169,7 @@ def main():
     parser.add_argument("--no-auto-approve", action="store_true", help="자동 승인 비활성화 (전부 사람 검수)")
     parser.add_argument("--data-dir", help="임포트할 기존 전사 데이터 디렉토리")
     parser.add_argument("--unverified", action="store_true", help="임포트 데이터를 미검수로 처리")
+    parser.add_argument("--num-gpus", type=int, default=4, help="학습 GPU 수 (기본: 4)")
 
     args = parser.parse_args()
 
@@ -1139,7 +1203,7 @@ def main():
         print(f"\n검수 UI: http://localhost:8080/review")
 
     elif args.command == "train":
-        trainer = ContinuousTrainer(base_model=args.model, device=args.device)
+        trainer = ContinuousTrainer(base_model=args.model, device=args.device, num_gpus=args.num_gpus)
         trainer.train(epochs=args.epochs, learning_rate=args.lr)
 
     elif args.command == "evaluate":
