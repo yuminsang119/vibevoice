@@ -680,15 +680,63 @@ async def control_page():
     return FileResponse(Path(__file__).parent / "control.html")
 
 
+# ---------- 검수(리뷰) API ----------
+
+@app.get("/api/review/queue")
+async def api_review_queue():
+    """검수 대기 목록"""
+    from pipeline import DataValidator
+    queue = DataValidator.get_review_queue()
+    return {"queue": queue, "count": len(queue)}
+
+
+@app.get("/api/review/audio/{call_id}")
+async def api_review_audio(call_id: str):
+    """검수용 오디오 파일 스트리밍"""
+    from pipeline import REVIEW_DIR
+    call_dir = REVIEW_DIR / call_id
+    wav_files = list(call_dir.glob("*.wav"))
+    if not wav_files:
+        return {"status": "not_found"}
+    return FileResponse(wav_files[0], media_type="audio/wav")
+
+
+class ReviewSubmitRequest(BaseModel):
+    call_id: str
+    approved: bool
+    corrected_segments: List[Dict[str, Any]] = []
+
+
+@app.post("/api/review/submit")
+async def api_review_submit(req: ReviewSubmitRequest):
+    """검수 결과 제출 (교정 텍스트 + 승인/거부)"""
+    from pipeline import DataValidator
+    ok = DataValidator.submit_review(req.call_id, req.corrected_segments, req.approved)
+    if not ok:
+        return {"status": "not_found"}
+    # 승인된 건 바로 학습/평가 폴더로 이동
+    if req.approved:
+        validator = DataValidator()
+        validator.process_reviewed()
+    return {"status": "ok", "approved": req.approved}
+
+
+@app.get("/review")
+async def review_page():
+    """데이터 검수 UI 페이지"""
+    return FileResponse(Path(__file__).parent / "review.html")
+
+
 @app.get("/api/pipeline/status")
 async def api_pipeline_status():
     """파이프라인 데이터 수집 현황"""
-    from pipeline import RAW_DIR, VALIDATED_DIR, EVAL_DIR, MODELS_DIR, DEPLOY_DIR
+    from pipeline import RAW_DIR, VALIDATED_DIR, EVAL_DIR, MODELS_DIR, DEPLOY_DIR, REVIEW_DIR
     collector: DataCollector = app.state.data_collector
     current = DEPLOY_DIR / "current"
     return {
         "collector_stats": collector.stats,
         "raw_count": sum(1 for d in RAW_DIR.iterdir() if d.is_dir()),
+        "review_count": sum(1 for d in REVIEW_DIR.iterdir() if d.is_dir()),
         "validated_count": sum(1 for d in VALIDATED_DIR.iterdir() if d.is_dir()),
         "eval_count": sum(1 for d in EVAL_DIR.iterdir() if d.is_dir()),
         "model_count": sum(1 for d in MODELS_DIR.iterdir() if d.is_dir()),

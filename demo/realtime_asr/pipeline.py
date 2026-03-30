@@ -123,6 +123,134 @@ class DataCollector:
         logger.info(f"수집 완료: {call_id} ({duration:.1f}초, {len(segments)}세그먼트)")
         return call_dir
 
+    def import_existing_data(
+        self,
+        data_dir: str,
+        audio_ext: str = ".wav",
+        label_ext: str = ".json",
+        verified: bool = True,
+    ) -> Dict[str, int]:
+        """기존 전사 데이터를 파이프라인에 임포트합니다.
+
+        이미 사람이 검수한 전사 데이터(예: 1600시간)가 있을 때 사용합니다.
+        verified=True면 검수 완료로 간주하고 바로 학습/평가용으로 분류합니다.
+
+        지원 형식:
+          1) {name}.wav + {name}.json (1:1 매칭)
+          2) 디렉토리 안에 audio.wav + label.json
+          3) JSON 안에 "audio_path" 필드로 오디오 경로 지정
+
+        JSON 최소 형식:
+          {"segments": [{"text": "...", "start": 0.0, "end": 1.0}]}
+          또는
+          {"text": "전체 전사 텍스트"}
+        """
+        src = Path(data_dir)
+        if not src.exists():
+            logger.error(f"경로가 존재하지 않습니다: {data_dir}")
+            return {"imported": 0, "skipped": 0, "errors": 0}
+
+        stats = {"imported": 0, "skipped": 0, "errors": 0}
+
+        # JSON 파일 목록
+        json_files = sorted(src.rglob(f"*{label_ext}"))
+        logger.info(f"임포트 대상: {len(json_files)}건 ({data_dir})")
+
+        for json_path in json_files:
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    label = json.load(f)
+
+                # 오디오 파일 찾기
+                audio_path = None
+                if "audio_path" in label:
+                    candidate = json_path.parent / label["audio_path"]
+                    if candidate.exists():
+                        audio_path = candidate
+                if not audio_path:
+                    candidate = json_path.with_suffix(audio_ext)
+                    if candidate.exists():
+                        audio_path = candidate
+                if not audio_path:
+                    for wav in json_path.parent.glob(f"*{audio_ext}"):
+                        audio_path = wav
+                        break
+
+                if not audio_path:
+                    stats["skipped"] += 1
+                    continue
+
+                # 세그먼트 정규화
+                segments = label.get("segments", [])
+                if not segments and "text" in label:
+                    segments = [{"text": label["text"], "start": 0.0, "end": 0.0}]
+
+                if not segments:
+                    stats["skipped"] += 1
+                    continue
+
+                # 세그먼트 형식 통일
+                normalized = []
+                for seg in segments:
+                    normalized.append({
+                        "speaker": seg.get("speaker", seg.get("Speaker", 0)),
+                        "text": seg.get("text", seg.get("Content", "")),
+                        "start": round(seg.get("start", seg.get("Start", 0.0)), 2),
+                        "end": round(seg.get("end", seg.get("End", 0.0)), 2),
+                    })
+
+                # 대상 디렉토리 결정
+                call_id = json_path.stem
+                if verified:
+                    # 검수 완료 → 바로 학습/평가용
+                    hash_val = int(hashlib.md5(call_id.encode()).hexdigest(), 16)
+                    if (hash_val % 100) < 10:  # 10% 평가
+                        dest_dir = EVAL_DIR / call_id
+                    else:
+                        dest_dir = VALIDATED_DIR / call_id
+                else:
+                    dest_dir = RAW_DIR / call_id
+
+                if dest_dir.exists():
+                    stats["skipped"] += 1
+                    continue
+
+                dest_dir.mkdir(parents=True)
+
+                # 오디오 복사
+                shutil.copy2(audio_path, dest_dir / audio_path.name)
+
+                # 통일된 레이블 저장
+                new_label = {
+                    "audio_path": audio_path.name,
+                    "audio_duration": label.get("audio_duration", label.get("duration", 0)),
+                    "segments": normalized,
+                    "customized_context": label.get("customized_context",
+                                                     label.get("hotwords", [])),
+                    "metadata": {
+                        "imported_from": str(json_path),
+                        "imported_at": datetime.now().isoformat(),
+                        "review_status": "approved" if verified else "raw",
+                        "source": "import",
+                    },
+                }
+                with open(dest_dir / f"{call_id}.json", "w", encoding="utf-8") as f:
+                    json.dump(new_label, f, ensure_ascii=False, indent=2)
+
+                stats["imported"] += 1
+                if stats["imported"] % 100 == 0:
+                    logger.info(f"임포트 진행: {stats['imported']}건...")
+
+            except Exception as e:
+                stats["errors"] += 1
+                logger.warning(f"임포트 오류 [{json_path.name}]: {e}")
+
+        logger.info(
+            f"임포트 완료: {stats['imported']}건 성공, "
+            f"{stats['skipped']}건 스킵, {stats['errors']}건 오류"
+        )
+        return stats
+
     def _save_wav(self, audio: np.ndarray, sample_rate: int, path: Path):
         pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
         with wave.open(str(path), "wb") as wf:
@@ -134,32 +262,98 @@ class DataCollector:
 
 # ---------- 2단계: 데이터 검증 ----------
 
+# 검수 상태
+REVIEW_STATUS_PENDING = "pending"     # 검수 대기
+REVIEW_STATUS_APPROVED = "approved"   # 사람이 검수 완료
+REVIEW_STATUS_REJECTED = "rejected"   # 품질 불량 → 학습 제외
+REVIEW_STATUS_AUTO = "auto_approved"  # 자동 승인 (높은 신뢰도)
+
+REVIEW_DIR = PIPELINE_DATA_DIR / "review"  # 사람 검수 대기 큐
+REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+
 class DataValidator:
-    """수집된 데이터를 검증하고 학습/평가용으로 분류합니다."""
+    """수집된 데이터를 검증하고, 사람 검수 후 학습/평가용으로 분류합니다.
+
+    핵심: ASR 초기 WER이 높으므로 자동 전사 결과를 그대로 학습하면
+    오류가 강화됩니다. 따라서:
+
+    1) 자동 품질 필터 → 명백히 불량한 데이터 제거
+    2) 신뢰도 점수 → 높은 신뢰도(≥0.85)는 자동 승인, 나머지는 사람 검수
+    3) 사람 검수 UI → 검수자가 전사 텍스트를 교정 후 승인
+    4) 승인된 데이터만 학습에 사용
+    """
 
     MIN_DURATION = 3.0       # 최소 3초
     MAX_DURATION = 600.0     # 최대 10분
     MIN_SEGMENTS = 1         # 최소 1개 세그먼트
     MIN_TEXT_LENGTH = 5      # 세그먼트 최소 글자 수
     EVAL_RATIO = 0.1         # 10%는 평가용
+    AUTO_APPROVE_THRESHOLD = 0.85  # 이 신뢰도 이상이면 자동 승인
 
     def __init__(self):
-        self.stats = {"valid": 0, "invalid": 0, "eval": 0, "train": 0}
+        self.stats = {
+            "valid": 0, "invalid": 0, "eval": 0, "train": 0,
+            "auto_approved": 0, "pending_review": 0,
+        }
 
-    def validate_all(self) -> Dict[str, int]:
-        """RAW_DIR의 모든 데이터를 검증합니다."""
+    def validate_all(self, auto_approve: bool = True) -> Dict[str, int]:
+        """RAW_DIR의 모든 데이터를 검증합니다.
+
+        Args:
+            auto_approve: True면 신뢰도 높은 데이터 자동 승인, False면 전부 검수 대기
+        """
         for call_dir in sorted(RAW_DIR.iterdir()):
             if not call_dir.is_dir():
                 continue
-            self._validate_call(call_dir)
+            self._validate_call(call_dir, auto_approve=auto_approve)
 
         logger.info(
-            f"검증 완료: 유효 {self.stats['valid']} / 무효 {self.stats['invalid']} "
-            f"(학습 {self.stats['train']}, 평가 {self.stats['eval']})"
+            f"검증 완료: 유효 {self.stats['valid']} / 무효 {self.stats['invalid']} | "
+            f"자동승인 {self.stats['auto_approved']}, 검수대기 {self.stats['pending_review']}, "
+            f"학습 {self.stats['train']}, 평가 {self.stats['eval']}"
         )
         return self.stats
 
-    def _validate_call(self, call_dir: Path):
+    def process_reviewed(self) -> Dict[str, int]:
+        """사람이 검수 완료한 데이터를 학습/평가용으로 이동합니다."""
+        moved = {"train": 0, "eval": 0, "rejected": 0}
+
+        for call_dir in sorted(REVIEW_DIR.iterdir()):
+            if not call_dir.is_dir():
+                continue
+
+            json_files = list(call_dir.glob("*.json"))
+            if not json_files:
+                continue
+
+            with open(json_files[0], "r", encoding="utf-8") as f:
+                label = json.load(f)
+
+            status = label.get("metadata", {}).get("review_status")
+
+            if status == REVIEW_STATUS_REJECTED:
+                moved["rejected"] += 1
+                continue
+
+            if status == REVIEW_STATUS_APPROVED:
+                # 검수 완료 → 학습/평가 분류
+                hash_val = int(hashlib.md5(call_dir.name.encode()).hexdigest(), 16)
+                if (hash_val % 100) < (self.EVAL_RATIO * 100):
+                    dest = EVAL_DIR / call_dir.name
+                    moved["eval"] += 1
+                else:
+                    dest = VALIDATED_DIR / call_dir.name
+                    moved["train"] += 1
+
+                if not dest.exists():
+                    shutil.copytree(call_dir, dest)
+                    logger.info(f"검수 완료 → {'평가' if 'eval' in str(dest) else '학습'}: {call_dir.name}")
+
+        logger.info(f"검수 처리: 학습 {moved['train']}, 평가 {moved['eval']}, 거부 {moved['rejected']}")
+        return moved
+
+    def _validate_call(self, call_dir: Path, auto_approve: bool = True):
         json_files = list(call_dir.glob("*.json"))
         if not json_files:
             self.stats["invalid"] += 1
@@ -169,35 +363,35 @@ class DataValidator:
         with open(label_path, "r", encoding="utf-8") as f:
             label = json.load(f)
 
-        # 검증 체크
+        # 이미 처리된 데이터면 스킵
+        review_status = label.get("metadata", {}).get("review_status")
+        if review_status in (REVIEW_STATUS_APPROVED, REVIEW_STATUS_AUTO, REVIEW_STATUS_REJECTED):
+            return
+
+        # 기본 품질 체크
         issues = []
 
-        # 오디오 존재 확인
         audio_filename = label.get("audio_path", "")
         audio_path = call_dir / audio_filename
         if not audio_path.exists():
             issues.append("오디오 파일 없음")
 
-        # 길이 확인
         duration = label.get("audio_duration", 0)
         if duration < self.MIN_DURATION:
             issues.append(f"너무 짧음 ({duration:.1f}초)")
         if duration > self.MAX_DURATION:
             issues.append(f"너무 김 ({duration:.1f}초)")
 
-        # 세그먼트 확인
         segments = label.get("segments", [])
         if len(segments) < self.MIN_SEGMENTS:
             issues.append("세그먼트 없음")
 
-        # 텍스트 품질 확인
         for i, seg in enumerate(segments):
             text = seg.get("text", "")
             if len(text) < self.MIN_TEXT_LENGTH:
                 issues.append(f"세그먼트 {i} 텍스트 너무 짧음")
                 break
 
-        # 타임스탬프 정합성
         for i, seg in enumerate(segments):
             if seg.get("start", 0) > seg.get("end", 0):
                 issues.append(f"세그먼트 {i} 시간 역전")
@@ -208,19 +402,171 @@ class DataValidator:
             logger.warning(f"검증 실패 [{call_dir.name}]: {', '.join(issues)}")
             return
 
-        # 유효 → 학습/평가 분류
         self.stats["valid"] += 1
-        hash_val = int(hashlib.md5(call_dir.name.encode()).hexdigest(), 16)
-        if (hash_val % 100) < (self.EVAL_RATIO * 100):
-            dest = EVAL_DIR / call_dir.name
-            self.stats["eval"] += 1
-        else:
-            dest = VALIDATED_DIR / call_dir.name
-            self.stats["train"] += 1
 
-        if not dest.exists():
-            shutil.copytree(call_dir, dest)
-            logger.info(f"검증 통과: {call_dir.name} → {'평가' if 'eval' in str(dest) else '학습'}")
+        # 신뢰도 점수 계산
+        confidence = self._compute_confidence(label, segments)
+        label.setdefault("metadata", {})["confidence"] = round(confidence, 3)
+
+        if auto_approve and confidence >= self.AUTO_APPROVE_THRESHOLD:
+            # 높은 신뢰도 → 자동 승인 → 바로 학습/평가용으로
+            label["metadata"]["review_status"] = REVIEW_STATUS_AUTO
+            with open(label_path, "w", encoding="utf-8") as f:
+                json.dump(label, f, ensure_ascii=False, indent=2)
+
+            hash_val = int(hashlib.md5(call_dir.name.encode()).hexdigest(), 16)
+            if (hash_val % 100) < (self.EVAL_RATIO * 100):
+                dest = EVAL_DIR / call_dir.name
+                self.stats["eval"] += 1
+            else:
+                dest = VALIDATED_DIR / call_dir.name
+                self.stats["train"] += 1
+
+            if not dest.exists():
+                shutil.copytree(call_dir, dest)
+
+            self.stats["auto_approved"] += 1
+            logger.info(f"자동 승인 (신뢰도 {confidence:.2f}): {call_dir.name}")
+        else:
+            # 낮은 신뢰도 → 사람 검수 대기 큐로
+            label["metadata"]["review_status"] = REVIEW_STATUS_PENDING
+            with open(label_path, "w", encoding="utf-8") as f:
+                json.dump(label, f, ensure_ascii=False, indent=2)
+
+            dest = REVIEW_DIR / call_dir.name
+            if not dest.exists():
+                shutil.copytree(call_dir, dest)
+
+            self.stats["pending_review"] += 1
+            logger.info(f"검수 대기 (신뢰도 {confidence:.2f}): {call_dir.name}")
+
+    def _compute_confidence(self, label: Dict, segments: List[Dict]) -> float:
+        """ASR 전사 결과의 신뢰도를 추정합니다.
+
+        완벽한 신뢰도는 아니지만, 명백히 나쁜 전사를 걸러내는 데 유용합니다.
+        0.0 (매우 불확실) ~ 1.0 (매우 확실)
+        """
+        score = 0.5  # 기본 점수
+
+        # 1. 세그먼트 수 - 119 통화는 보통 여러 발화가 있음
+        seg_count = len(segments)
+        if 3 <= seg_count <= 30:
+            score += 0.1
+        elif seg_count > 30:
+            score -= 0.1  # 너무 많은 세그먼트는 잘못된 분할 가능성
+
+        # 2. 텍스트 품질 지표
+        full_text = " ".join(seg.get("text", "") for seg in segments)
+        text_len = len(full_text)
+
+        # 한국어 비율 체크 (한글이 대부분이어야 함)
+        import re
+        korean_chars = len(re.findall(r"[가-힣]", full_text))
+        if text_len > 0:
+            korean_ratio = korean_chars / text_len
+            if korean_ratio >= 0.6:
+                score += 0.15
+            elif korean_ratio < 0.3:
+                score -= 0.2  # 한국어가 너무 적으면 오인식 가능성
+
+        # 3. 119 관련 키워드 존재 여부 (도메인 적합성)
+        domain_keywords = [
+            "119", "신고", "화재", "불", "구급", "구조", "사고",
+            "환자", "부상", "의식", "호흡", "출혈",
+            "여보세요", "네", "아파트", "도로", "건물",
+        ]
+        keyword_hits = sum(1 for kw in domain_keywords if kw in full_text)
+        if keyword_hits >= 3:
+            score += 0.15
+        elif keyword_hits >= 1:
+            score += 0.05
+
+        # 4. 주소 패턴 존재 (도로명, 지번 등)
+        addr_patterns = [
+            r"[가-힣]+(?:로|대로|길)\s*\d+",  # 도로명
+            r"[가-힣]+[동리읍면]\s*\d+",        # 지번
+            r"[가-힣]+[시군구]",                 # 시군구
+        ]
+        for pat in addr_patterns:
+            if re.search(pat, full_text):
+                score += 0.05
+
+        # 5. 반복 텍스트 감지 (ASR 루핑 오류)
+        if seg_count >= 3:
+            texts = [seg.get("text", "") for seg in segments]
+            unique_texts = set(texts)
+            if len(unique_texts) < len(texts) * 0.5:
+                score -= 0.3  # 절반 이상이 동일 텍스트면 ASR 오류
+
+        # 6. 평균 세그먼트 길이 (너무 길거나 짧으면 의심)
+        avg_seg_len = text_len / max(seg_count, 1)
+        if 5 <= avg_seg_len <= 100:
+            score += 0.05
+        elif avg_seg_len > 200:
+            score -= 0.1  # 하나의 세그먼트에 너무 많은 텍스트
+
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def get_review_queue() -> List[Dict]:
+        """검수 대기 중인 데이터 목록을 반환합니다."""
+        queue = []
+        for call_dir in sorted(REVIEW_DIR.iterdir()):
+            if not call_dir.is_dir():
+                continue
+            json_files = list(call_dir.glob("*.json"))
+            if not json_files:
+                continue
+            with open(json_files[0], "r", encoding="utf-8") as f:
+                label = json.load(f)
+            status = label.get("metadata", {}).get("review_status", "")
+            if status == REVIEW_STATUS_PENDING:
+                queue.append({
+                    "call_id": call_dir.name,
+                    "duration": label.get("audio_duration", 0),
+                    "segments": label.get("segments", []),
+                    "confidence": label.get("metadata", {}).get("confidence", 0),
+                    "collected_at": label.get("metadata", {}).get("collected_at", ""),
+                })
+        return queue
+
+    @staticmethod
+    def submit_review(call_id: str, corrected_segments: List[Dict], approved: bool) -> bool:
+        """검수 결과를 제출합니다.
+
+        Args:
+            call_id: 통화 ID
+            corrected_segments: 교정된 세그먼트 (사람이 수정한 텍스트)
+            approved: True면 승인 (교정 텍스트로 학습), False면 거부
+        """
+        call_dir = REVIEW_DIR / call_id
+        if not call_dir.exists():
+            return False
+
+        json_files = list(call_dir.glob("*.json"))
+        if not json_files:
+            return False
+
+        label_path = json_files[0]
+        with open(label_path, "r", encoding="utf-8") as f:
+            label = json.load(f)
+
+        if approved:
+            # 교정된 텍스트로 세그먼트 업데이트
+            label["segments"] = corrected_segments
+            label["metadata"]["review_status"] = REVIEW_STATUS_APPROVED
+            label["metadata"]["reviewed_at"] = datetime.now().isoformat()
+            # 원본 ASR 결과도 보존 (나중에 WER 비교용)
+            label["metadata"]["original_asr_segments"] = label.get("segments", [])
+        else:
+            label["metadata"]["review_status"] = REVIEW_STATUS_REJECTED
+            label["metadata"]["reviewed_at"] = datetime.now().isoformat()
+
+        with open(label_path, "w", encoding="utf-8") as f:
+            json.dump(label, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"검수 {'승인' if approved else '거부'}: {call_id}")
+        return True
 
 
 # ---------- 3단계: 학습 ----------
@@ -746,7 +1092,7 @@ def main():
     parser = argparse.ArgumentParser(description="119 ASR 지속 학습 파이프라인")
     parser.add_argument(
         "command",
-        choices=["collect", "validate", "train", "evaluate", "deploy", "run", "history", "status"],
+        choices=["collect", "import", "validate", "review", "train", "evaluate", "deploy", "run", "history", "status"],
         help="실행할 명령",
     )
     parser.add_argument("--model", default="microsoft/VibeVoice-ASR", help="기본 모델 경로")
@@ -757,12 +1103,40 @@ def main():
     parser.add_argument("--min-samples", type=int, default=10, help="최소 신규 샘플 수")
     parser.add_argument("--max-wer", type=float, default=15.0, help="배포 WER 기준치 (%)")
     parser.add_argument("--model-dir", help="평가/배포할 모델 디렉토리")
+    parser.add_argument("--no-auto-approve", action="store_true", help="자동 승인 비활성화 (전부 사람 검수)")
+    parser.add_argument("--data-dir", help="임포트할 기존 전사 데이터 디렉토리")
+    parser.add_argument("--unverified", action="store_true", help="임포트 데이터를 미검수로 처리")
 
     args = parser.parse_args()
 
-    if args.command == "validate":
+    if args.command == "import":
+        if not args.data_dir:
+            logger.error("--data-dir를 지정하세요 (기존 전사 데이터 경로)")
+            logger.info("예: python pipeline.py import --data-dir /path/to/1600h_data")
+            logger.info("    python pipeline.py import --data-dir /data/transcribed --unverified")
+            return
+        collector = DataCollector()
+        collector.import_existing_data(
+            args.data_dir,
+            verified=not args.unverified,
+        )
+
+    elif args.command == "validate":
         validator = DataValidator()
-        validator.validate_all()
+        validator.validate_all(auto_approve=not args.no_auto_approve)
+
+    elif args.command == "review":
+        validator = DataValidator()
+        # 검수 완료된 데이터 처리
+        validator.process_reviewed()
+        # 대기 목록 출력
+        queue = validator.get_review_queue()
+        print(f"\n검수 대기: {len(queue)}건")
+        for item in queue[:20]:
+            print(f"  {item['call_id']} ({item['duration']:.1f}초, 신뢰도 {item['confidence']:.2f})")
+        if len(queue) > 20:
+            print(f"  ... 외 {len(queue)-20}건")
+        print(f"\n검수 UI: http://localhost:8080/review")
 
     elif args.command == "train":
         trainer = ContinuousTrainer(base_model=args.model, device=args.device)
