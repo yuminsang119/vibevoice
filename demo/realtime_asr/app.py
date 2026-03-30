@@ -50,6 +50,7 @@ from starlette.websockets import WebSocketState
 
 from geocoding import extract_addresses, geocode, geocode_from_segments, GeoResult
 from control import SessionManager, classify_urgency, classify_report_type, extract_patient_info
+from pipeline import DataCollector
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -269,7 +270,8 @@ async def startup():
     app.state.asr_service = service
     app.state.lock = asyncio.Lock()
     app.state.session_manager = SessionManager()
-    logger.info("실시간 ASR 서버 준비 완료")
+    app.state.data_collector = DataCollector()
+    logger.info("실시간 ASR 서버 준비 완료 (데이터 수집 활성화)")
 
 
 @app.websocket("/ws/transcribe")
@@ -390,6 +392,22 @@ async def websocket_transcribe(ws: WebSocket):
                 result = await enrich_with_geocoding(result)
                 if ws.client_state == WebSocketState.CONNECTED:
                     await ws.send_text(json.dumps(result, ensure_ascii=False))
+
+                # 학습 데이터 자동 수집
+                segments = result.get("segments", [])
+                if segments:
+                    try:
+                        collector: DataCollector = app.state.data_collector
+                        session_id = f"ws_{id(ws)}_{int(time.time())}"
+                        collector.save_call(
+                            audio_data=audio_resampled,
+                            sample_rate=ASR_SAMPLE_RATE,
+                            segments=segments,
+                            session_id=session_id,
+                            hotwords=service.hotwords,
+                        )
+                    except Exception as e:
+                        logger.warning(f"데이터 수집 실패: {e}")
             except Exception as e:
                 logger.error(f"최종 전사 오류: {e}")
             finally:
@@ -504,6 +522,22 @@ async def websocket_twilio(ws: WebSocket):
                         result["call_sid"] = call_sid
                         result = await enrich_with_geocoding(result)
                         await ws.send_text(json.dumps(result, ensure_ascii=False))
+
+                        # 학습 데이터 자동 수집
+                        segments = result.get("segments", [])
+                        if segments:
+                            try:
+                                collector: DataCollector = app.state.data_collector
+                                collector.save_call(
+                                    audio_data=audio_resampled,
+                                    sample_rate=ASR_SAMPLE_RATE,
+                                    segments=segments,
+                                    session_id=call_sid or f"twilio_{int(time.time())}",
+                                    hotwords=service.hotwords,
+                                    metadata={"source": "twilio", "call_sid": call_sid},
+                                )
+                            except Exception as e:
+                                logger.warning(f"데이터 수집 실패: {e}")
                     except Exception as e:
                         logger.error(f"최종 전사 오류: {e}")
                     finally:
@@ -644,6 +678,22 @@ async def api_control_close_session(session_id: str):
 async def control_page():
     """통제 대시보드 페이지"""
     return FileResponse(Path(__file__).parent / "control.html")
+
+
+@app.get("/api/pipeline/status")
+async def api_pipeline_status():
+    """파이프라인 데이터 수집 현황"""
+    from pipeline import RAW_DIR, VALIDATED_DIR, EVAL_DIR, MODELS_DIR, DEPLOY_DIR
+    collector: DataCollector = app.state.data_collector
+    current = DEPLOY_DIR / "current"
+    return {
+        "collector_stats": collector.stats,
+        "raw_count": sum(1 for d in RAW_DIR.iterdir() if d.is_dir()),
+        "validated_count": sum(1 for d in VALIDATED_DIR.iterdir() if d.is_dir()),
+        "eval_count": sum(1 for d in EVAL_DIR.iterdir() if d.is_dir()),
+        "model_count": sum(1 for d in MODELS_DIR.iterdir() if d.is_dir()),
+        "deployed_model": current.resolve().name if current.is_symlink() else None,
+    }
 
 
 @app.get("/health")
